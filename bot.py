@@ -1,5 +1,7 @@
 import os
 import json
+import threading
+import time
 from datetime import datetime, timedelta
 from flask import Flask, request
 import telebot
@@ -13,6 +15,7 @@ import pandas as pd
 # -------------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # https://<твоя-служба>.onrender.com
+CHAT_ID = int(os.getenv("CHAT_ID"))  # твой Telegram ID
 bot = telebot.TeleBot(BOT_TOKEN)
 
 # -------------------------
@@ -25,7 +28,7 @@ creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
 client = gspread.authorize(creds)
 
 SHEET_NAME = os.getenv("SHEET_NAME", "ExpensesBot")
-sheet = client.open(SHEET_NAME).sheet1  # первая страница
+sheet = client.open(SHEET_NAME).sheet1
 
 # -------------------------
 # Функции работы с данными
@@ -45,13 +48,15 @@ def get_report(start_date, end_date):
     report = filtered.groupby('Category')['Amount'].sum().to_dict()
     return report
 
-def format_report(report_dict, start, end=None):
+def format_table_report(report_dict, start, end):
     if not report_dict:
-        return f"Нет трат за период {start}" if end is None else f"Нет трат за период {start} — {end}"
-    text = f"📊 Траты за период {start} — {end}:\n\n" if end else f"📊 Траты с {start}:\n\n"
+        return f"Нет трат за период {start} — {end}"
+    text = f"📊 Траты за период {start} — {end}\n\n"
+    text += f"{'Категория':<15} {'Сумма':>7}\n"
+    text += "-"*24 + "\n"
     for cat, total in report_dict.items():
-        text += f"{cat}: {total} тг\n"
-    return text
+        text += f"{cat:<15} {total:>7} тг\n"
+    return f"```\n{text}\n```"
 
 # -------------------------
 # Обработка сообщений
@@ -74,16 +79,16 @@ def report_week(message):
     today = datetime.now().date()
     week_ago = today - timedelta(days=7)
     report = get_report(week_ago, today)
-    text = format_report(report, week_ago, today)
-    bot.reply_to(message, text)
+    text = format_table_report(report, week_ago, today)
+    bot.reply_to(message, text, parse_mode="Markdown")
 
 @bot.message_handler(commands=['month'])
 def report_month(message):
     today = datetime.now().date()
     month_ago = today - timedelta(days=30)
     report = get_report(month_ago, today)
-    text = format_report(report, month_ago, today)
-    bot.reply_to(message, text)
+    text = format_table_report(report, month_ago, today)
+    bot.reply_to(message, text, parse_mode="Markdown")
 
 @bot.message_handler(commands=['period'])
 def period_start(message):
@@ -105,8 +110,8 @@ def period_process(message):
         bot.register_next_step_handler(message, period_process)
         return
     report = get_report(start, end)
-    text = format_report(report, start, end)
-    bot.send_message(message.chat.id, text)
+    text = format_table_report(report, start, end)
+    bot.send_message(message.chat.id, text, parse_mode="Markdown")
 
 # -------------------------
 # Меню /start
@@ -131,6 +136,32 @@ def callback_inline(call):
         report_month(call.message)
     elif call.data == "period":
         period_start(call.message)
+
+# -------------------------
+# Автоматическая еженедельная и ежемесячная отправка
+# -------------------------
+def scheduled_reports():
+    while True:
+        now = datetime.now()
+        # Еженедельный отчёт — понедельник 10:00
+        if now.weekday() == 0 and now.hour == 10 and now.minute == 0:
+            start = (now - timedelta(days=7)).strftime("%Y-%m-%d")
+            end = now.strftime("%Y-%m-%d")
+            report = get_report(start, end)
+            text = format_table_report(report, start, end)
+            bot.send_message(CHAT_ID, text, parse_mode="Markdown")
+            time.sleep(60)
+        # Ежемесячный отчёт — 1 число 10:00
+        if now.day == 1 and now.hour == 10 and now.minute == 0:
+            first_day_last_month = (now.replace(day=1) - timedelta(days=1)).replace(day=1)
+            last_day_last_month = now.replace(day=1) - timedelta(days=1)
+            report = get_report(first_day_last_month.strftime("%Y-%m-%d"), last_day_last_month.strftime("%Y-%m-%d"))
+            text = format_table_report(report, first_day_last_month.strftime("%Y-%m-%d"), last_day_last_month.strftime("%Y-%m-%d"))
+            bot.send_message(CHAT_ID, text, parse_mode="Markdown")
+            time.sleep(60)
+        time.sleep(30)
+
+threading.Thread(target=scheduled_reports, daemon=True).start()
 
 # -------------------------
 # Flask сервер и Webhook
